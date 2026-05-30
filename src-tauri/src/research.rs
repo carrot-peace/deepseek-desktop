@@ -20,7 +20,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

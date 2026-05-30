@@ -1,16 +1,21 @@
 import { useEffect, useRef } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import { MessageBubble } from "./MessageBubble";
+import { ResearchPanel } from "./ResearchPanel";
 
 export function MessageList() {
   const messages = useChatStore((state) => state.messages);
+  const currentResearchTaskId = useChatStore((state) => state.currentResearchTaskId);
+  const currentResearchTask = useChatStore((state) =>
+    currentResearchTaskId ? state.researchTasks[currentResearchTaskId] : undefined,
+  );
   const scrollerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const node = scrollerRef.current;
     if (!node) return;
     node.scrollTop = node.scrollHeight;
-  }, [messages]);
+  }, [messages, currentResearchTask?.task.report, currentResearchTask?.activities.length, currentResearchTask?.sources.length]);
 
   if (messages.length === 0) {
     return (
@@ -31,6 +36,7 @@ export function MessageList() {
           .map((message) => (
             <MessageBubble key={message.id} message={message} />
           ))}
+        {currentResearchTask ? <ResearchPanel /> : null}
       </div>
     </div>
   );

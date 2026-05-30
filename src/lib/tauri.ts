@@ -5,8 +5,16 @@ import type {
   ChatMessage,
   Conversation,
   ContentDeltaEvent,
+  PrepareResearchTaskRequest,
+  PrepareResearchTaskResponse,
   ReasoningDeltaEvent,
+  ResearchActivity,
+  ResearchProgressEvent,
+  ResearchReportDeltaEvent,
+  ResearchSource,
+  ResearchTaskDetail,
   SendMessageRequest,
+  StartResearchTaskRequest,
 } from "./types";
 
 export const commands = {
@@ -27,6 +35,22 @@ export const commands = {
   sendMessage: (request: SendMessageRequest) => invoke<void>("send_message", { request }),
   stopGeneration: (conversationId: string) =>
     invoke<void>("stop_generation", { conversationId }),
+  prepareResearchTask: (request: PrepareResearchTaskRequest) =>
+    invoke<PrepareResearchTaskResponse>("prepare_research_task", { request }),
+  startResearchTask: (request: StartResearchTaskRequest) =>
+    invoke<ResearchTaskDetail>("start_research_task", { request }),
+  pauseResearchTask: (taskId: string) =>
+    invoke<ResearchTaskDetail>("pause_research_task", { taskId }),
+  resumeResearchTask: (taskId: string) =>
+    invoke<ResearchTaskDetail>("resume_research_task", { taskId }),
+  cancelResearchTask: (taskId: string) =>
+    invoke<ResearchTaskDetail>("cancel_research_task", { taskId }),
+  getResearchTask: (taskId: string) =>
+    invoke<ResearchTaskDetail>("get_research_task", { taskId }),
+  getResearchTasks: (conversationId: string) =>
+    invoke<ResearchTaskDetail[]>("get_research_tasks", { conversationId }),
+  exportResearchTask: (taskId: string) =>
+    invoke<string>("export_research_task", { taskId }),
 };
 
 export const events = {
@@ -40,4 +64,16 @@ export const events = {
     listen("chat:done", (event) => handler(event.payload as { conversationId: string; messageId: string })),
   onError: (handler: (payload: { conversationId: string; messageId?: string; error: string }) => void) =>
     listen("chat:error", (event) => handler(event.payload as { conversationId: string; messageId?: string; error: string })),
+  onResearchProgress: (handler: (payload: ResearchProgressEvent) => void) =>
+    listen("research:progress", (event) => handler(event.payload as ResearchProgressEvent)),
+  onResearchActivity: (handler: (payload: ResearchActivity) => void) =>
+    listen("research:activity", (event) => handler(event.payload as ResearchActivity)),
+  onResearchSourcesDelta: (handler: (payload: ResearchSource[]) => void) =>
+    listen("research:sources-delta", (event) => handler(event.payload as ResearchSource[])),
+  onResearchReportDelta: (handler: (payload: ResearchReportDeltaEvent) => void) =>
+    listen("research:report-delta", (event) => handler(event.payload as ResearchReportDeltaEvent)),
+  onResearchDone: (handler: (payload: { conversationId: string; messageId: string }) => void) =>
+    listen("research:done", (event) => handler(event.payload as { conversationId: string; messageId: string })),
+  onResearchError: (handler: (payload: { conversationId: string; messageId?: string; error: string }) => void) =>
+    listen("research:error", (event) => handler(event.payload as { conversationId: string; messageId?: string; error: string })),
 };

@@ -240,13 +240,18 @@ pub struct SearchPlan {
 pub struct PlannedSearchQuery {
     pub query: String,
     pub topic: Option<String>,
+    #[serde(alias = "searchDepth")]
     pub search_depth: Option<String>,
+    #[serde(alias = "maxResults")]
     pub max_results: Option<u8>,
-    #[serde(default)]
+    #[serde(default, alias = "includeDomains")]
     pub include_domains: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "excludeDomains")]
     pub exclude_domains: Vec<String>,
+    #[serde(alias = "startDate")]
     pub start_date: Option<String>,
+    #[serde(alias = "endDate")]
     pub end_date: Option<String>,
+    #[serde(alias = "includeRawContent")]
     pub include_raw_content: Option<bool>,
 }

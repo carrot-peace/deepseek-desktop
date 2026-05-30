@@ -1,11 +1,22 @@
 import { create } from "zustand";
 import { events, commands } from "../lib/tauri";
-import type { ChatMessage, Conversation } from "../lib/types";
+import type {
+  ChatMessage,
+  Conversation,
+  ResearchActivity,
+  ResearchProgressEvent,
+  ResearchSource,
+  ResearchSourcePolicy,
+  ResearchTaskDetail,
+} from "../lib/types";
 
 interface ChatState {
   conversations: Conversation[];
   currentConversationId?: string;
   messages: ChatMessage[];
+  researchTasks: Record<string, ResearchTaskDetail>;
+  currentResearchTaskId?: string;
+  researchProgress: Record<string, ResearchProgressEvent>;
   isGenerating: boolean;
   error?: string;
   loadConversations: () => Promise<void>;
@@ -13,6 +24,15 @@ interface ChatState {
   deleteConversation: (id: string) => Promise<void>;
   switchConversation: (id: string) => Promise<void>;
   sendMessage: (content: string) => Promise<void>;
+  prepareResearch: (
+    content: string,
+    options: { sourcePolicy: ResearchSourcePolicy; domains: string[] },
+  ) => Promise<void>;
+  startResearchTask: (taskId: string) => Promise<void>;
+  pauseResearchTask: (taskId: string) => Promise<void>;
+  resumeResearchTask: (taskId: string) => Promise<void>;
+  cancelResearchTask: (taskId: string) => Promise<void>;
+  exportResearchTask: (taskId: string) => Promise<void>;
   stopGeneration: () => Promise<void>;
   updateConversation: (conversation: Conversation) => Promise<void>;
   initializeEventListeners: () => Promise<void>;
@@ -25,15 +45,71 @@ declare global {
   var __deepseekChatListenersReady: boolean | undefined;
 }
 
+const detailMap = (details: ResearchTaskDetail[]) =>
+  Object.fromEntries(details.map((detail) => [detail.task.id, detail]));
+
+const newestTaskId = (details: ResearchTaskDetail[]) => details[0]?.task.id;
+
+const upsertDetail = (
+  tasks: Record<string, ResearchTaskDetail>,
+  detail: ResearchTaskDetail,
+) => ({
+  ...tasks,
+  [detail.task.id]: detail,
+});
+
+const appendActivity = (
+  detail: ResearchTaskDetail,
+  activity: ResearchActivity,
+): ResearchTaskDetail => {
+  if (detail.activities.some((item) => item.id === activity.id)) return detail;
+  return { ...detail, activities: [...detail.activities, activity] };
+};
+
+const appendSources = (
+  detail: ResearchTaskDetail,
+  sources: ResearchSource[],
+): ResearchTaskDetail => {
+  const seen = new Set(detail.sources.map((source) => source.id));
+  const next = sources.filter((source) => !seen.has(source.id));
+  if (next.length === 0) return detail;
+  return {
+    ...detail,
+    sources: [...detail.sources, ...next].sort((a, b) => a.sourceNumber - b.sourceNumber),
+  };
+};
+
+const downloadMarkdown = (filename: string, content: string) => {
+  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+};
+
 export const useChatStore = create<ChatState>((set, get) => ({
   conversations: [],
   messages: [],
+  researchTasks: {},
+  researchProgress: {},
   isGenerating: false,
   async loadConversations() {
     const conversations = await commands.getConversations();
     const currentConversationId = conversations[0]?.id;
     const messages = currentConversationId ? await commands.getMessages(currentConversationId) : [];
-    set({ conversations, currentConversationId, messages, error: undefined });
+    const researchDetails = currentConversationId ? await commands.getResearchTasks(currentConversationId) : [];
+    set({
+      conversations,
+      currentConversationId,
+      messages,
+      researchTasks: detailMap(researchDetails),
+      currentResearchTaskId: newestTaskId(researchDetails),
+      error: undefined,
+    });
   },
   async createConversation() {
     const conversation = await commands.createConversation();
@@ -41,6 +117,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       conversations: [conversation, ...state.conversations],
       currentConversationId: conversation.id,
       messages: [],
+      researchTasks: {},
+      currentResearchTaskId: undefined,
+      researchProgress: {},
       error: undefined,
     }));
   },
@@ -50,7 +129,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const remaining = get().conversations.filter((conversation) => conversation.id !== id);
       const nextId = get().currentConversationId === id ? remaining[0]?.id : get().currentConversationId;
       const messages = nextId ? await commands.getMessages(nextId) : [];
-      set({ conversations: remaining, currentConversationId: nextId, messages, error: undefined });
+      const researchDetails = nextId ? await commands.getResearchTasks(nextId) : [];
+      set({
+        conversations: remaining,
+        currentConversationId: nextId,
+        messages,
+        researchTasks: detailMap(researchDetails),
+        currentResearchTaskId: newestTaskId(researchDetails),
+        error: undefined,
+      });
     } catch (error) {
       set({ error: `删除会话失败：${String(error)}` });
       throw error;
@@ -58,7 +145,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
   async switchConversation(id) {
     const messages = await commands.getMessages(id);
-    set({ currentConversationId: id, messages, error: undefined });
+    const researchDetails = await commands.getResearchTasks(id);
+    set({
+      currentConversationId: id,
+      messages,
+      researchTasks: detailMap(researchDetails),
+      currentResearchTaskId: newestTaskId(researchDetails),
+      error: undefined,
+    });
   },
   async sendMessage(content) {
     const trimmed = content.trim();
@@ -92,7 +186,99 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ isGenerating: false, error: String(error) });
     }
   },
+  async prepareResearch(content, options) {
+    const trimmed = content.trim();
+    if (!trimmed || get().isGenerating) return;
+
+    let conversation = get().conversations.find((item) => item.id === get().currentConversationId);
+    if (!conversation) {
+      await get().createConversation();
+      conversation = get().conversations.find((item) => item.id === get().currentConversationId);
+    }
+    if (!conversation) return;
+
+    set({ isGenerating: true, error: undefined });
+    try {
+      const response = await commands.prepareResearchTask({
+        conversationId: conversation.id,
+        prompt: trimmed,
+        model: conversation.model,
+        sourcePolicy: options.sourcePolicy,
+        domains: options.domains,
+      });
+      const conversations = await commands.getConversations();
+      set((state) => ({
+        conversations,
+        messages: state.messages.some((message) => message.id === response.userMessage.id)
+          ? state.messages
+          : [...state.messages, response.userMessage],
+        researchTasks: upsertDetail(state.researchTasks, response.detail),
+        currentResearchTaskId: response.detail.task.id,
+        isGenerating: false,
+      }));
+    } catch (error) {
+      set({ isGenerating: false, error: String(error) });
+    }
+  },
+  async startResearchTask(taskId) {
+    const detail = get().researchTasks[taskId];
+    const conversation = get().conversations.find((item) => item.id === detail?.task.conversationId);
+    if (!detail || !conversation || get().isGenerating) return;
+
+    set({ isGenerating: true, error: undefined, currentResearchTaskId: taskId });
+    try {
+      const next = await commands.startResearchTask({ taskId, model: conversation.model });
+      set((state) => ({
+        researchTasks: upsertDetail(state.researchTasks, next),
+        currentResearchTaskId: taskId,
+      }));
+    } catch (error) {
+      set({ isGenerating: false, error: String(error) });
+    }
+  },
+  async pauseResearchTask(taskId) {
+    try {
+      const detail = await commands.pauseResearchTask(taskId);
+      set((state) => ({ researchTasks: upsertDetail(state.researchTasks, detail), isGenerating: false }));
+    } catch (error) {
+      set({ error: String(error) });
+    }
+  },
+  async resumeResearchTask(taskId) {
+    try {
+      const detail = await commands.resumeResearchTask(taskId);
+      set((state) => ({ researchTasks: upsertDetail(state.researchTasks, detail), isGenerating: true }));
+    } catch (error) {
+      set({ error: String(error) });
+    }
+  },
+  async cancelResearchTask(taskId) {
+    try {
+      const detail = await commands.cancelResearchTask(taskId);
+      set((state) => ({ researchTasks: upsertDetail(state.researchTasks, detail), isGenerating: false }));
+    } catch (error) {
+      set({ isGenerating: false, error: String(error) });
+    }
+  },
+  async exportResearchTask(taskId) {
+    try {
+      const markdown = await commands.exportResearchTask(taskId);
+      const detail = get().researchTasks[taskId];
+      const filename = `${detail?.task.topic ?? "deep-research"}.md`.replace(/[/:*?"<>|]/g, "-");
+      downloadMarkdown(filename, markdown);
+    } catch (error) {
+      set({ error: String(error) });
+    }
+  },
   async stopGeneration() {
+    const currentResearchTaskId = get().currentResearchTaskId;
+    const currentTask = currentResearchTaskId
+      ? get().researchTasks[currentResearchTaskId]
+      : undefined;
+    if (currentTask && ["draft", "running", "paused"].includes(currentTask.task.status)) {
+      await get().cancelResearchTask(currentTask.task.id);
+      return;
+    }
     const id = get().currentConversationId;
     if (!id) return;
     await commands.stopGeneration(id);
@@ -176,6 +362,68 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }),
       events.onDone(() => set({ isGenerating: false })),
       events.onError(({ error }) => set({ isGenerating: false, error })),
+      events.onResearchProgress((progress) => {
+        set((state) => {
+          const detail = state.researchTasks[progress.taskId];
+          const finished = ["completed", "failed", "cancelled"].includes(progress.status);
+          return {
+            researchProgress: { ...state.researchProgress, [progress.taskId]: progress },
+            researchTasks: detail
+              ? {
+                  ...state.researchTasks,
+                  [progress.taskId]: {
+                    ...detail,
+                    task: { ...detail.task, status: progress.status },
+                  },
+                }
+              : state.researchTasks,
+            isGenerating: finished ? false : state.isGenerating,
+          };
+        });
+      }),
+      events.onResearchActivity((activity) => {
+        set((state) => {
+          const detail = state.researchTasks[activity.taskId];
+          if (!detail) return state;
+          return {
+            researchTasks: {
+              ...state.researchTasks,
+              [activity.taskId]: appendActivity(detail, activity),
+            },
+          };
+        });
+      }),
+      events.onResearchSourcesDelta((sources) => {
+        const taskId = sources[0]?.taskId;
+        if (!taskId) return;
+        set((state) => {
+          const detail = state.researchTasks[taskId];
+          if (!detail) return state;
+          return {
+            researchTasks: {
+              ...state.researchTasks,
+              [taskId]: appendSources(detail, sources),
+            },
+          };
+        });
+      }),
+      events.onResearchReportDelta(({ taskId, delta }) => {
+        set((state) => {
+          const detail = state.researchTasks[taskId];
+          if (!detail) return state;
+          return {
+            researchTasks: {
+              ...state.researchTasks,
+              [taskId]: {
+                ...detail,
+                task: { ...detail.task, report: `${detail.task.report}${delta}` },
+              },
+            },
+          };
+        });
+      }),
+      events.onResearchDone(() => set({ isGenerating: false })),
+      events.onResearchError(({ error }) => set({ isGenerating: false, error })),
     ]);
   },
 }));
