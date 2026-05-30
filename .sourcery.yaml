@@ -1,0 +1,14 @@
+ignore:
+  - .git
+  - node_modules
+  - dist
+  - .npm-cache
+  - .cargo-home
+  - src-tauri/target
+  - src-tauri/gen
+
+github:
+  ignore_labels:
+    - sourcery-ignore
+  request_review: author
+  sourcery_branch: sourcery/{base_branch}
