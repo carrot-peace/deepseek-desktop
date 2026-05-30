@@ -1,9 +1,8 @@
 use crate::models::{
     ChatErrorEvent, ChatMessage, ChatStartedEvent, ContentDeltaEvent, PlannedSearchQuery,
-    PrepareResearchTaskRequest, PrepareResearchTaskResponse, ResearchActivity,
-    ResearchDepthBudget, ResearchPlan, ResearchProgressEvent, ResearchReportDeltaEvent,
-    ResearchSource, ResearchTask, ResearchTaskDetail, SearchPlan, SearchResult,
-    StartResearchTaskRequest,
+    PrepareResearchTaskRequest, PrepareResearchTaskResponse, ResearchActivity, ResearchDepthBudget,
+    ResearchPlan, ResearchProgressEvent, ResearchReportDeltaEvent, ResearchSource, ResearchTask,
+    ResearchTaskDetail, SearchPlan, SearchResult, StartResearchTaskRequest,
 };
 use crate::search::tavily_search;
 use crate::secrets;
@@ -26,11 +25,29 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const RESEARCH_REQUEST_TIMEOUT_SECS: u64 = 30 * 60;
-const DEFAULT_MAX_ROUNDS: u8 = 4;
+const DEFAULT_MAX_ROUNDS: u8 = 5;
 const DEFAULT_QUERIES_PER_ROUND: u8 = 6;
-const DEFAULT_SOURCE_LIMIT: u16 = 60;
+const DEFAULT_SOURCE_LIMIT: u16 = 80;
 const MAX_DOMAINS: usize = 8;
 const MAX_QUERY_CHARS: usize = 120;
+
+#[derive(Debug)]
+enum ResearchRunError {
+    Cancelled,
+    Failed(String),
+}
+
+impl From<String> for ResearchRunError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<&str> for ResearchRunError {
+    fn from(error: &str) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
 
 #[derive(Clone)]
 pub struct ResearchRunControl {
@@ -58,26 +75,21 @@ impl ResearchRunControl {
 #[tauri::command]
 pub async fn prepare_research_task(
     request: PrepareResearchTaskRequest,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PrepareResearchTaskResponse, String> {
     validate_research_prompt(&request.prompt)?;
-    let api_key = secrets::get_secret("deepseek_api_key")?;
+    let api_key = secrets::get_secret("deepseek_api_key").ok();
     let settings = normalize_settings(state.db.get_settings().unwrap_or_default())?;
     let source_policy = normalize_source_policy(&request.source_policy);
     let domains = sanitize_domains(request.domains);
-    let plan = create_research_plan(
-        &api_key,
-        &settings.deepseek_base_url,
-        &request.model,
+    let plan = normalize_research_plan(
+        fallback_research_plan(&request.prompt, &source_policy, &domains),
         &request.prompt,
         &source_policy,
         &domains,
-    )
-    .await
-    .unwrap_or_else(|_| fallback_research_plan(&request.prompt, &source_policy, &domains));
-    let plan = normalize_research_plan(plan, &request.prompt, &source_policy, &domains);
-    let plan_json =
-        serde_json::to_string(&plan).map_err(|_| "研究计划序列化失败。".to_string())?;
+    );
+    let plan_json = serde_json::to_string(&plan).map_err(|_| "研究计划序列化失败。".to_string())?;
     let domains_json =
         serde_json::to_string(&domains).map_err(|_| "研究域名序列化失败。".to_string())?;
     let now = Utc::now().to_rfc3339();
@@ -107,7 +119,7 @@ pub async fn prepare_research_task(
         assistant_message_id: None,
         topic: plan.title.clone(),
         status: "draft".to_string(),
-        source_policy,
+        source_policy: source_policy.clone(),
         domains_json,
         plan_json,
         report: String::new(),
@@ -121,10 +133,109 @@ pub async fn prepare_research_task(
         id: Uuid::new_v4().to_string(),
         task_id: task.id.clone(),
         activity_type: "plan".to_string(),
-        title: "已生成研究计划".to_string(),
-        detail: Some("请确认计划后开始研究。".to_string()),
+        title: "已创建基础研究计划".to_string(),
+        detail: Some("正在后台细化计划，可先查看或稍后开始研究。".to_string()),
         created_at: Utc::now().to_rfc3339(),
     })?;
+    if let Some(api_key) = api_key {
+        emit_progress(
+            &app,
+            &task.id,
+            &task.conversation_id,
+            "draft",
+            "planning",
+            0,
+            1,
+            "正在细化研究计划",
+        );
+
+        let task_id = task.id.clone();
+        let prompt = request.prompt.clone();
+        let model = request.model.clone();
+        let source_policy_for_plan = source_policy.clone();
+        let domains_for_plan = domains.clone();
+        let app_for_task = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = app_for_task.state::<AppState>();
+            let refined = create_research_plan(
+                &api_key,
+                &settings.deepseek_base_url,
+                &model,
+                &prompt,
+                &source_policy_for_plan,
+                &domains_for_plan,
+            )
+            .await
+            .map(|plan| {
+                normalize_research_plan(plan, &prompt, &source_policy_for_plan, &domains_for_plan)
+            });
+
+            let Ok(plan) = refined else {
+                let _ = save_activity(
+                    &app_for_task,
+                    &state,
+                    &task_id,
+                    "plan_fallback",
+                    "继续使用基础研究计划",
+                    Some("后台细化计划失败，可直接开始研究或稍后重试。".to_string()),
+                );
+                return;
+            };
+
+            if let Ok(mut task) = state.db.get_research_task(&task_id) {
+                if task.status != "draft" {
+                    return;
+                }
+                task.topic = plan.title.clone();
+                if let Ok(plan_json) = serde_json::to_string(&plan) {
+                    task.plan_json = plan_json;
+                    task.updated_at = Utc::now().to_rfc3339();
+                    if state.db.save_research_task(&task).is_ok() {
+                        let _ = save_activity(
+                            &app_for_task,
+                            &state,
+                            &task_id,
+                            "plan_refined",
+                            "已细化研究计划",
+                            Some("计划已根据模型规划更新。".to_string()),
+                        );
+                        if let Ok(detail) = state.db.get_research_task_detail(&task_id) {
+                            let _ = app_for_task.emit("research:plan-ready", detail);
+                        }
+                        emit_progress(
+                            &app_for_task,
+                            &task.id,
+                            &task.conversation_id,
+                            "draft",
+                            "planned",
+                            1,
+                            1,
+                            "研究计划已更新",
+                        );
+                    }
+                }
+            }
+        });
+    } else {
+        state.db.save_research_activity(&ResearchActivity {
+            id: Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            activity_type: "plan_fallback".to_string(),
+            title: "继续使用基础研究计划".to_string(),
+            detail: Some("缺少 DeepSeek Key，已跳过后台计划细化。".to_string()),
+            created_at: Utc::now().to_rfc3339(),
+        })?;
+        emit_progress(
+            &app,
+            &task.id,
+            &task.conversation_id,
+            "draft",
+            "planned",
+            1,
+            1,
+            "使用基础研究计划",
+        );
+    }
 
     Ok(PrepareResearchTaskResponse {
         detail: state.db.get_research_task_detail(&task.id)?,
@@ -142,6 +253,8 @@ pub async fn start_research_task(
     if matches!(task.status.as_str(), "running" | "completed") {
         return Err("研究任务已经在运行或已完成。".to_string());
     }
+    let _deepseek_key = secrets::get_secret("deepseek_api_key")?;
+    let _tavily_key = secrets::get_secret("tavily_api_key")?;
 
     let assistant_message_id = task
         .assistant_message_id
@@ -184,40 +297,81 @@ pub async fn start_research_task(
     let model = request.model.clone();
     let app_for_task = app.clone();
     tauri::async_runtime::spawn(async move {
-        let result =
-            execute_research_task(app_for_task.clone(), task_id.clone(), model, assistant_message_id, control)
-                .await;
+        let result = execute_research_task(
+            app_for_task.clone(),
+            task_id.clone(),
+            model,
+            assistant_message_id,
+            control,
+        )
+        .await;
         let state = app_for_task.state::<AppState>();
         if let Ok(mut runs) = state.research_runs.lock() {
             runs.remove(&task_id);
         }
-        if let Err(error) = result {
-            let status = if error == "研究已取消。" {
-                "cancelled"
-            } else {
-                "failed"
-            };
-            let completed_at = Utc::now().to_rfc3339();
-            let _ = state
-                .db
-                .update_research_status(&task_id, status, Some(&error), Some(&completed_at));
-            if let Ok(task) = state.db.get_research_task(&task_id) {
-                let _ = app_for_task.emit(
-                    "research:error",
-                    ChatErrorEvent {
-                        conversation_id: task.conversation_id.clone(),
-                        message_id: task.assistant_message_id.clone(),
-                        error: error.clone(),
-                    },
+        match result {
+            Ok(()) => {}
+            Err(ResearchRunError::Cancelled) => {
+                if let Ok(task) = state.db.get_research_task(&task_id) {
+                    let completed_at = Utc::now().to_rfc3339();
+                    let _ = state.db.update_research_status(
+                        &task_id,
+                        "cancelled",
+                        None,
+                        Some(&completed_at),
+                    );
+                    emit_progress(
+                        &app_for_task,
+                        &task.id,
+                        &task.conversation_id,
+                        "cancelled",
+                        "cancel",
+                        DEFAULT_MAX_ROUNDS as u16 + 2,
+                        DEFAULT_MAX_ROUNDS as u16 + 2,
+                        "研究已取消",
+                    );
+                    let _ = app_for_task.emit(
+                        "research:done",
+                        ChatStartedEvent {
+                            conversation_id: task.conversation_id.clone(),
+                            message_id: task.assistant_message_id.clone().unwrap_or_default(),
+                        },
+                    );
+                    let _ = app_for_task.emit(
+                        "chat:done",
+                        ChatStartedEvent {
+                            conversation_id: task.conversation_id,
+                            message_id: task.assistant_message_id.unwrap_or_default(),
+                        },
+                    );
+                }
+            }
+            Err(ResearchRunError::Failed(error)) => {
+                let completed_at = Utc::now().to_rfc3339();
+                let _ = state.db.update_research_status(
+                    &task_id,
+                    "failed",
+                    Some(&error),
+                    Some(&completed_at),
                 );
-                let _ = app_for_task.emit(
-                    "chat:error",
-                    ChatErrorEvent {
-                        conversation_id: task.conversation_id,
-                        message_id: task.assistant_message_id,
-                        error,
-                    },
-                );
+                if let Ok(task) = state.db.get_research_task(&task_id) {
+                    let _ = app_for_task.emit(
+                        "research:error",
+                        ChatErrorEvent {
+                            conversation_id: task.conversation_id.clone(),
+                            message_id: task.assistant_message_id.clone(),
+                            error: error.clone(),
+                        },
+                    );
+                    let _ = app_for_task.emit(
+                        "chat:error",
+                        ChatErrorEvent {
+                            conversation_id: task.conversation_id,
+                            message_id: task.assistant_message_id,
+                            error,
+                        },
+                    );
+                }
             }
         }
     });
@@ -231,15 +385,8 @@ pub async fn pause_research_task(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ResearchTaskDetail, String> {
-    if let Some(control) = state
-        .research_runs
-        .lock()
-        .map_err(|_| "研究任务状态锁定失败".to_string())?
-        .get(&task_id)
-        .cloned()
-    {
-        control.set_paused(true);
-    }
+    let control = active_research_control(&state, &task_id)?;
+    control.set_paused(true);
     state
         .db
         .update_research_status(&task_id, "paused", None, None)?;
@@ -263,18 +410,11 @@ pub async fn resume_research_task(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ResearchTaskDetail, String> {
-    if let Some(control) = state
-        .research_runs
-        .lock()
-        .map_err(|_| "研究任务状态锁定失败".to_string())?
-        .get(&task_id)
-        .cloned()
-    {
-        control.set_paused(false);
-        state
-            .db
-            .update_research_status(&task_id, "running", None, None)?;
-    }
+    let control = active_research_control(&state, &task_id)?;
+    control.set_paused(false);
+    state
+        .db
+        .update_research_status(&task_id, "running", None, None)?;
     let task = state.db.get_research_task(&task_id)?;
     emit_progress(
         &app,
@@ -295,20 +435,26 @@ pub async fn cancel_research_task(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ResearchTaskDetail, String> {
-    if let Some(control) = state
-        .research_runs
-        .lock()
-        .map_err(|_| "研究任务状态锁定失败".to_string())?
-        .get(&task_id)
-        .cloned()
-    {
+    let task = state.db.get_research_task(&task_id)?;
+    if task.status != "draft" {
+        let control = {
+            let runs = state
+                .research_runs
+                .lock()
+                .map_err(|_| "研究任务状态锁定失败".to_string())?;
+            runs.get(&task_id)
+                .cloned()
+                .ok_or_else(|| "研究任务没有正在运行的后台进程，请重新开始。".to_string())?
+        };
         control.cancel();
+        if let Ok(mut runs) = state.research_runs.lock() {
+            runs.remove(&task_id);
+        }
     }
     let completed_at = Utc::now().to_rfc3339();
     state
         .db
         .update_research_status(&task_id, "cancelled", None, Some(&completed_at))?;
-    let task = state.db.get_research_task(&task_id)?;
     emit_progress(
         &app,
         &task.id,
@@ -353,7 +499,7 @@ async fn execute_research_task(
     model: String,
     assistant_message_id: String,
     control: ResearchRunControl,
-) -> Result<(), String> {
+) -> Result<(), ResearchRunError> {
     let state = app.state::<AppState>();
     let deepseek_key = secrets::get_secret("deepseek_api_key")?;
     let tavily_key = secrets::get_secret("tavily_api_key")?;
@@ -395,7 +541,9 @@ async fn execute_research_task(
                 &model,
                 &plan,
                 &all_sources,
-                budget.queries_per_round.unwrap_or(DEFAULT_QUERIES_PER_ROUND),
+                budget
+                    .queries_per_round
+                    .unwrap_or(DEFAULT_QUERIES_PER_ROUND),
             )
             .await
             .unwrap_or_else(|_| fallback_follow_up_queries(&plan, &all_sources))
@@ -404,17 +552,12 @@ async fn execute_research_task(
             round_queries,
             &task.source_policy,
             &parse_domains_json(&task.domains_json),
-            budget.queries_per_round.unwrap_or(DEFAULT_QUERIES_PER_ROUND),
+            budget
+                .queries_per_round
+                .unwrap_or(DEFAULT_QUERIES_PER_ROUND),
         );
         if round_queries.is_empty() {
-            save_activity(
-                &app,
-                &state,
-                &task_id,
-                "gap",
-                "未发现新的补充查询",
-                None,
-            )?;
+            save_activity(&app, &state, &task_id, "gap", "未发现新的补充查询", None)?;
             break;
         }
 
@@ -439,11 +582,13 @@ async fn execute_research_task(
             answer_guidance: Some("Collect evidence for a cited deep research report.".to_string()),
         };
         let results = tavily_search(&tavily_key, &plan.goal, search_plan, 10).await?;
+        wait_if_paused_or_cancelled(&control).await?;
         let remaining = budget
             .source_limit
             .unwrap_or(DEFAULT_SOURCE_LIMIT)
             .saturating_sub(all_sources.len() as u16) as usize;
         let results = results.into_iter().take(remaining).collect::<Vec<_>>();
+        wait_if_paused_or_cancelled(&control).await?;
         let inserted = state.db.save_research_sources(&task_id, &results)?;
         if !inserted.is_empty() {
             let _ = app.emit("research:sources-delta", &inserted);
@@ -467,7 +612,9 @@ async fn execute_research_task(
     }
 
     if all_sources.is_empty() {
-        return Err("没有找到可用于研究的来源。".to_string());
+        return Err(ResearchRunError::Failed(
+            "没有找到可用于研究的来源。".to_string(),
+        ));
     }
 
     wait_if_paused_or_cancelled(&control).await?;
@@ -606,7 +753,8 @@ async fn create_research_plan(
     let content = body["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| "研究计划内容为空。".to_string())?;
-    let json_text = extract_json_object(content).ok_or_else(|| "研究计划不是 JSON。".to_string())?;
+    let json_text =
+        extract_json_object(content).ok_or_else(|| "研究计划不是 JSON。".to_string())?;
     serde_json::from_str::<ResearchPlan>(&json_text).map_err(|_| "研究计划 JSON 无效。".to_string())
 }
 
@@ -702,7 +850,8 @@ async fn create_follow_up_queries(
     let content = body["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| "研究缺口分析内容为空。".to_string())?;
-    let json_text = extract_json_object(content).ok_or_else(|| "研究缺口分析不是 JSON。".to_string())?;
+    let json_text =
+        extract_json_object(content).ok_or_else(|| "研究缺口分析不是 JSON。".to_string())?;
     let parsed: GapResponse =
         serde_json::from_str(&json_text).map_err(|_| "研究缺口分析 JSON 无效。".to_string())?;
     Ok(parsed
@@ -724,7 +873,7 @@ async fn stream_research_report(
     sources: &[ResearchSource],
     assistant_message_id: &str,
     control: ResearchRunControl,
-) -> Result<String, String> {
+) -> Result<String, ResearchRunError> {
     let response = research_client()?
         .post(format!(
             "{}/chat/completions",
@@ -754,7 +903,7 @@ async fn stream_research_report(
         .await
         .map_err(|_| "研究报告请求失败或超时。".to_string())?;
     if !response.status().is_success() {
-        return Err(format!("研究报告返回错误：{}", response.status()));
+        return Err(format!("研究报告返回错误：{}", response.status()).into());
     }
 
     let mut report = String::new();
@@ -788,7 +937,8 @@ async fn stream_research_report(
                     return Err(format!(
                         "研究报告过长，请控制在 {} 字符以内。",
                         MAX_ASSISTANT_OUTPUT_CHARS
-                    ));
+                    )
+                    .into());
                 }
                 report.push_str(piece);
                 let _ = app.emit(
@@ -922,10 +1072,23 @@ fn emit_progress(
     );
 }
 
-async fn wait_if_paused_or_cancelled(control: &ResearchRunControl) -> Result<(), String> {
+fn active_research_control(
+    state: &State<'_, AppState>,
+    task_id: &str,
+) -> Result<ResearchRunControl, String> {
+    state
+        .research_runs
+        .lock()
+        .map_err(|_| "研究任务状态锁定失败".to_string())?
+        .get(task_id)
+        .cloned()
+        .ok_or_else(|| "研究任务没有正在运行的后台进程，请重新开始。".to_string())
+}
+
+async fn wait_if_paused_or_cancelled(control: &ResearchRunControl) -> Result<(), ResearchRunError> {
     loop {
         if control.cancellation.is_cancelled() {
-            return Err("研究已取消。".to_string());
+            return Err(ResearchRunError::Cancelled);
         }
         if !control.paused.load(Ordering::SeqCst) {
             return Ok(());
@@ -940,7 +1103,10 @@ fn fallback_research_plan(prompt: &str, source_policy: &str, domains: &[String])
         goal: prompt.trim().to_string(),
         audience: Some("general".to_string()),
         key_questions: vec![prompt.trim().to_string()],
-        must_have: vec!["current evidence".to_string(), "major viewpoints".to_string()],
+        must_have: vec![
+            "current evidence".to_string(),
+            "major viewpoints".to_string(),
+        ],
         initial_queries: fallback_initial_queries(prompt),
         success_criteria: vec![
             "Answer the main research question with citations.".to_string(),
@@ -1332,7 +1498,10 @@ mod tests {
 
         assert_eq!(plan.source_policy.as_deref(), Some("web"));
         assert!(!plan.initial_queries.is_empty());
-        assert_eq!(plan.depth_budget.unwrap().max_rounds, Some(DEFAULT_MAX_ROUNDS));
+        assert_eq!(
+            plan.depth_budget.unwrap().max_rounds,
+            Some(DEFAULT_MAX_ROUNDS)
+        );
     }
 
     #[test]
@@ -1353,5 +1522,16 @@ mod tests {
     fn detects_valid_report_citation() {
         assert!(report_has_valid_citation("A claim [S2].", 3));
         assert!(!report_has_valid_citation("A claim without citation.", 3));
+    }
+
+    #[tokio::test]
+    async fn cancelled_control_returns_typed_cancel_error() {
+        let control = ResearchRunControl::new();
+        control.cancel();
+
+        match wait_if_paused_or_cancelled(&control).await {
+            Err(ResearchRunError::Cancelled) => {}
+            other => panic!("expected typed cancellation, got {other:?}"),
+        }
     }
 }

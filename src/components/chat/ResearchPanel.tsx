@@ -33,7 +33,6 @@ export function ResearchPanel() {
   const resumeResearchTask = useChatStore((state) => state.resumeResearchTask);
   const cancelResearchTask = useChatStore((state) => state.cancelResearchTask);
   const exportResearchTask = useChatStore((state) => state.exportResearchTask);
-  const isGenerating = useChatStore((state) => state.isGenerating);
 
   if (!detail) return null;
 
@@ -58,7 +57,7 @@ export function ResearchPanel() {
         </div>
         <div className="flex items-center gap-1">
           {detail.task.status === "draft" ? (
-            <IconButton title="开始研究" disabled={isGenerating} onClick={() => void startResearchTask(detail.task.id)}>
+            <IconButton title="开始研究" onClick={() => void startResearchTask(detail.task.id)}>
               <Play size={15} fill="currentColor" />
             </IconButton>
           ) : null}
@@ -163,8 +162,8 @@ function ResearchPlanSummary({ detail, plan }: { detail: ResearchTaskDetail; pla
     <div className="space-y-3">
       <div className="grid gap-3 sm:grid-cols-3">
         <Metric label="来源策略" value={policyLabel[detail.task.sourcePolicy] ?? detail.task.sourcePolicy} />
-        <Metric label="最大轮次" value={String(plan.depthBudget?.maxRounds ?? 4)} />
-        <Metric label="来源上限" value={String(plan.depthBudget?.sourceLimit ?? 60)} />
+        <Metric label="最大轮次" value={String(plan.depthBudget?.maxRounds ?? 5)} />
+        <Metric label="来源上限" value={String(plan.depthBudget?.sourceLimit ?? 80)} />
       </div>
       {domains.length > 0 ? (
         <div className="flex flex-wrap gap-2">

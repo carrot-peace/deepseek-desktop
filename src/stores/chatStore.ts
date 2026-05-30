@@ -17,6 +17,8 @@ interface ChatState {
   researchTasks: Record<string, ResearchTaskDetail>;
   currentResearchTaskId?: string;
   researchProgress: Record<string, ResearchProgressEvent>;
+  isChatGenerating: boolean;
+  isResearchRunning: boolean;
   isGenerating: boolean;
   error?: string;
   loadConversations: () => Promise<void>;
@@ -49,6 +51,15 @@ const detailMap = (details: ResearchTaskDetail[]) =>
   Object.fromEntries(details.map((detail) => [detail.task.id, detail]));
 
 const newestTaskId = (details: ResearchTaskDetail[]) => details[0]?.task.id;
+
+const hasRunningResearch = (details: ResearchTaskDetail[]) =>
+  details.some((detail) => detail.task.status === "running");
+
+const generationFlags = (isChatGenerating: boolean, isResearchRunning: boolean) => ({
+  isChatGenerating,
+  isResearchRunning,
+  isGenerating: isChatGenerating || isResearchRunning,
+});
 
 const upsertDetail = (
   tasks: Record<string, ResearchTaskDetail>,
@@ -96,6 +107,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   messages: [],
   researchTasks: {},
   researchProgress: {},
+  isChatGenerating: false,
+  isResearchRunning: false,
   isGenerating: false,
   async loadConversations() {
     const conversations = await commands.getConversations();
@@ -108,6 +121,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messages,
       researchTasks: detailMap(researchDetails),
       currentResearchTaskId: newestTaskId(researchDetails),
+      ...generationFlags(false, hasRunningResearch(researchDetails)),
       error: undefined,
     });
   },
@@ -120,6 +134,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       researchTasks: {},
       currentResearchTaskId: undefined,
       researchProgress: {},
+      ...generationFlags(false, false),
       error: undefined,
     }));
   },
@@ -136,6 +151,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         messages,
         researchTasks: detailMap(researchDetails),
         currentResearchTaskId: newestTaskId(researchDetails),
+        ...generationFlags(false, hasRunningResearch(researchDetails)),
         error: undefined,
       });
     } catch (error) {
@@ -151,12 +167,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messages,
       researchTasks: detailMap(researchDetails),
       currentResearchTaskId: newestTaskId(researchDetails),
+      ...generationFlags(false, hasRunningResearch(researchDetails)),
       error: undefined,
     });
   },
   async sendMessage(content) {
     const trimmed = content.trim();
-    if (!trimmed || get().isGenerating) return;
+    if (!trimmed || get().isChatGenerating || get().isResearchRunning) return;
 
     let conversation = get().conversations.find((item) => item.id === get().currentConversationId);
     if (!conversation) {
@@ -172,7 +189,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       content: trimmed,
       createdAt: nowIso(),
     };
-    set((state) => ({ messages: [...state.messages, userMessage], isGenerating: true, error: undefined }));
+    set((state) => ({
+      messages: [...state.messages, userMessage],
+      ...generationFlags(true, state.isResearchRunning),
+      error: undefined,
+    }));
 
     try {
       await commands.sendMessage({
@@ -183,12 +204,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         searchEnabled: conversation.searchEnabled,
       });
     } catch (error) {
-      set({ isGenerating: false, error: String(error) });
+      set((state) => ({ ...generationFlags(false, state.isResearchRunning), error: String(error) }));
     }
   },
   async prepareResearch(content, options) {
     const trimmed = content.trim();
-    if (!trimmed || get().isGenerating) return;
+    if (!trimmed || get().isChatGenerating || get().isResearchRunning) return;
 
     let conversation = get().conversations.find((item) => item.id === get().currentConversationId);
     if (!conversation) {
@@ -197,7 +218,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
     if (!conversation) return;
 
-    set({ isGenerating: true, error: undefined });
+    set((state) => ({ ...generationFlags(state.isChatGenerating, true), error: undefined }));
     try {
       const response = await commands.prepareResearchTask({
         conversationId: conversation.id,
@@ -214,32 +235,40 @@ export const useChatStore = create<ChatState>((set, get) => ({
           : [...state.messages, response.userMessage],
         researchTasks: upsertDetail(state.researchTasks, response.detail),
         currentResearchTaskId: response.detail.task.id,
-        isGenerating: false,
+        ...generationFlags(state.isChatGenerating, false),
       }));
     } catch (error) {
-      set({ isGenerating: false, error: String(error) });
+      set((state) => ({ ...generationFlags(state.isChatGenerating, false), error: String(error) }));
     }
   },
   async startResearchTask(taskId) {
     const detail = get().researchTasks[taskId];
     const conversation = get().conversations.find((item) => item.id === detail?.task.conversationId);
-    if (!detail || !conversation || get().isGenerating) return;
+    if (!detail || !conversation || get().isChatGenerating || get().isResearchRunning) return;
 
-    set({ isGenerating: true, error: undefined, currentResearchTaskId: taskId });
+    set((state) => ({
+      ...generationFlags(state.isChatGenerating, true),
+      error: undefined,
+      currentResearchTaskId: taskId,
+    }));
     try {
       const next = await commands.startResearchTask({ taskId, model: conversation.model });
       set((state) => ({
         researchTasks: upsertDetail(state.researchTasks, next),
         currentResearchTaskId: taskId,
+        ...generationFlags(state.isChatGenerating, next.task.status === "running"),
       }));
     } catch (error) {
-      set({ isGenerating: false, error: String(error) });
+      set((state) => ({ ...generationFlags(state.isChatGenerating, false), error: String(error) }));
     }
   },
   async pauseResearchTask(taskId) {
     try {
       const detail = await commands.pauseResearchTask(taskId);
-      set((state) => ({ researchTasks: upsertDetail(state.researchTasks, detail), isGenerating: false }));
+      set((state) => ({
+        researchTasks: upsertDetail(state.researchTasks, detail),
+        ...generationFlags(state.isChatGenerating, false),
+      }));
     } catch (error) {
       set({ error: String(error) });
     }
@@ -247,7 +276,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   async resumeResearchTask(taskId) {
     try {
       const detail = await commands.resumeResearchTask(taskId);
-      set((state) => ({ researchTasks: upsertDetail(state.researchTasks, detail), isGenerating: true }));
+      set((state) => ({
+        researchTasks: upsertDetail(state.researchTasks, detail),
+        ...generationFlags(state.isChatGenerating, detail.task.status === "running"),
+      }));
     } catch (error) {
       set({ error: String(error) });
     }
@@ -255,9 +287,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
   async cancelResearchTask(taskId) {
     try {
       const detail = await commands.cancelResearchTask(taskId);
-      set((state) => ({ researchTasks: upsertDetail(state.researchTasks, detail), isGenerating: false }));
+      set((state) => ({
+        researchTasks: upsertDetail(state.researchTasks, detail),
+        ...generationFlags(state.isChatGenerating, false),
+      }));
     } catch (error) {
-      set({ isGenerating: false, error: String(error) });
+      set((state) => ({ ...generationFlags(state.isChatGenerating, false), error: String(error) }));
     }
   },
   async exportResearchTask(taskId) {
@@ -275,14 +310,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const currentTask = currentResearchTaskId
       ? get().researchTasks[currentResearchTaskId]
       : undefined;
-    if (currentTask && ["draft", "running", "paused"].includes(currentTask.task.status)) {
+    if (currentTask && currentTask.task.status === "running") {
       await get().cancelResearchTask(currentTask.task.id);
       return;
     }
     const id = get().currentConversationId;
-    if (!id) return;
+    if (!id || !get().isChatGenerating) return;
     await commands.stopGeneration(id);
-    set({ isGenerating: false });
+    set((state) => generationFlags(false, state.isResearchRunning));
   },
   async updateConversation(conversation) {
     await commands.updateConversation(conversation);
@@ -360,12 +395,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       events.onReasoningDelta(({ conversationId, messageId, delta }) => {
         appendAssistantDelta(conversationId, messageId, delta, "reasoningContent");
       }),
-      events.onDone(() => set({ isGenerating: false })),
-      events.onError(({ error }) => set({ isGenerating: false, error })),
+      events.onDone(() =>
+        set((state) => generationFlags(false, state.isResearchRunning)),
+      ),
+      events.onError(({ error }) =>
+        set((state) => ({ ...generationFlags(false, state.isResearchRunning), error })),
+      ),
       events.onResearchProgress((progress) => {
         set((state) => {
           const detail = state.researchTasks[progress.taskId];
-          const finished = ["completed", "failed", "cancelled"].includes(progress.status);
           return {
             researchProgress: { ...state.researchProgress, [progress.taskId]: progress },
             researchTasks: detail
@@ -377,9 +415,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   },
                 }
               : state.researchTasks,
-            isGenerating: finished ? false : state.isGenerating,
+            ...generationFlags(state.isChatGenerating, progress.status === "running"),
           };
         });
+      }),
+      events.onResearchPlanReady((detail) => {
+        set((state) => ({
+          researchTasks: upsertDetail(state.researchTasks, detail),
+          currentResearchTaskId: detail.task.id,
+        }));
       }),
       events.onResearchActivity((activity) => {
         set((state) => {
@@ -422,8 +466,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
           };
         });
       }),
-      events.onResearchDone(() => set({ isGenerating: false })),
-      events.onResearchError(({ error }) => set({ isGenerating: false, error })),
+      events.onResearchDone(() =>
+        set((state) => generationFlags(state.isChatGenerating, false)),
+      ),
+      events.onResearchError(({ error }) =>
+        set((state) => ({ ...generationFlags(state.isChatGenerating, false), error })),
+      ),
     ]);
   },
 }));

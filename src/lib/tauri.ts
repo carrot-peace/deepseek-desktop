@@ -66,6 +66,8 @@ export const events = {
     listen("chat:error", (event) => handler(event.payload as { conversationId: string; messageId?: string; error: string })),
   onResearchProgress: (handler: (payload: ResearchProgressEvent) => void) =>
     listen("research:progress", (event) => handler(event.payload as ResearchProgressEvent)),
+  onResearchPlanReady: (handler: (payload: ResearchTaskDetail) => void) =>
+    listen("research:plan-ready", (event) => handler(event.payload as ResearchTaskDetail)),
   onResearchActivity: (handler: (payload: ResearchActivity) => void) =>
     listen("research:activity", (event) => handler(event.payload as ResearchActivity)),
   onResearchSourcesDelta: (handler: (payload: ResearchSource[]) => void) =>
