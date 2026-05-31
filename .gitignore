@@ -4,5 +4,14 @@ dist/
 .cargo-home/
 src-tauri/target/
 src-tauri/gen/
+src-tauri/icons/ios/
+src-tauri/icons/android/
+.claude/
 .DS_Store
 *.log
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+Thumbs.db
